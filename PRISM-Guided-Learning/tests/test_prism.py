@@ -15,9 +15,10 @@ def runner_capturing(monkeypatch, outputs, **kwargs):
     runner.calls = []
     replies = iter(outputs)
 
-    def call(cmd):
+    def call(cmd):   # a generator like the real one, so run/check drive it the same way
         runner.calls.append(cmd)
         return next(replies)
+        yield
     monkeypatch.setattr(runner, "_call", call)
     return runner
 

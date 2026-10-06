@@ -1,11 +1,14 @@
 """Run PRISM on an MDP and parse per-state results, reachable states and transitions."""
+import locale
 import os
 import re
 import subprocess
+import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Generator, List, Optional, Sequence, Tuple, TypeVar
 
 from config import PrismConfig
 from settings import get_prism_path
@@ -122,8 +125,28 @@ def _error_excerpt(stdout: str) -> str:
     return "\n".join(lines[:10]) or stdout[-2000:]
 
 
+@dataclass(frozen=True)
+class PrismCall:
+    """One PRISM process to run, yielded by the `*_steps` generators like an LLM task.
+
+    Whoever drives the generator runs it and sends back PRISM's output (stdout and stderr together, as
+    text), or throws `subprocess.TimeoutExpired` into the generator when it runs past `timeout` seconds.
+    """
+    cmd: Tuple[str, ...]
+    timeout: float
+
+
+T = TypeVar("T")
+PrismSteps = Generator[PrismCall, str, T]
+
+
 class PrismRunner:
-    """Thin wrapper around the PRISM command line (explicit engine)."""
+    """Thin wrapper around the PRISM command line (explicit engine).
+
+    `run_steps` and `check_steps` are generators: they yield each PRISM process to run as a `PrismCall`
+    and are sent its output, so a scheduler can run many instances' PRISM processes at once from one
+    thread. `run` and `check` run them to the end here, one process at a time.
+    """
 
     def __init__(self, config: PrismConfig, extra_args: Sequence[str] = (), prism_path: Optional[str] = None):
         """`extra_args` are appended to every model-checking call (not to `check`)."""
@@ -137,6 +160,14 @@ class PrismRunner:
         self.fallback_args = [[f"-{m}"] for m in config.fallback_methods] if config.method else []
 
     def check(self, model: str, prop: str) -> Optional[bool]:
+        """`check_steps`, run here."""
+        return run_now(self.check_steps(model, prop))
+
+    def run(self, model: str, properties: Sequence[str], export_transitions: bool = False) -> PrismResult:
+        """`run_steps`, run here."""
+        return run_now(self.run_steps(model, properties, export_transitions))
+
+    def check_steps(self, model: str, prop: str) -> PrismSteps[Optional[bool]]:
         """Decide one boolean property, e.g. a multi-objective achievability query `multi(...)`.
 
         Uses `prism.multi_engine` (sparse: the explicit engine has no multi-objective support) and
@@ -144,7 +175,7 @@ class PrismRunner:
         (undecided) when LP cannot handle the query.
         """
         with tempfile.TemporaryDirectory(prefix="prism_") as tmp:
-            stdout = self._call(self._command(*self._write_inputs(tmp, model, [prop]), self.multi_args))
+            stdout = yield from self._call(self._command(*self._write_inputs(tmp, model, [prop]), self.multi_args))
         if "not currently supported with linear programming" in stdout:
             # e.g. step-bounded objectives (UUV's deadline). PRISM's value-iteration alternative is
             # approximate and wrongly answers "no" at tight thresholds, so report "undecided".
@@ -154,7 +185,7 @@ class PrismRunner:
             raise PrismError(_error_excerpt(stdout))
         return m.group(1) == "true"
 
-    def run(self, model: str, properties: Sequence[str], export_transitions: bool = False) -> PrismResult:
+    def run_steps(self, model: str, properties: Sequence[str], export_transitions: bool = False) -> PrismSteps[PrismResult]:
         """Check `properties` (one per entry) on `model`.
 
         Properties wrapped in `filter(printall, ...)` also yield per-state values. The reachable
@@ -169,7 +200,7 @@ class PrismRunner:
                 cmd += ["-exporttrans", trans_path]
             # Try the configured method, then the fallbacks, while PRISM reports non-convergence
             for method_args in [self.method_args] + self.fallback_args:
-                stdout = self._call(cmd + method_args + self.extra_args)
+                stdout = yield from self._call(cmd + method_args + self.extra_args)
                 if "did not converge" not in stdout:
                     break
             if "Error:" in stdout or not os.path.exists(states_path):
@@ -199,6 +230,75 @@ class PrismRunner:
         return [self.prism_path, model_path, props_path, *engine_args, "-javamaxmem", self.java_max_mem,
                 "-maxiters", str(self.max_iters)]
 
-    def _call(self, cmd: List[str]) -> str:
-        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                              timeout=self.timeout).stdout
+    def _call(self, cmd: List[str]) -> PrismSteps[str]:
+        """One PRISM process: yields it and returns its output. Its input files must outlive the yield."""
+        return (yield PrismCall(tuple(cmd), self.timeout))
+
+
+# ---------------------------------------------------------------- running PRISM calls
+
+def run_call(call: PrismCall) -> str:
+    """Run `call` here and wait for it: its output, or `subprocess.TimeoutExpired`."""
+    return subprocess.run(list(call.cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                          timeout=call.timeout).stdout
+
+
+def run_now(steps: PrismSteps[T]) -> T:
+    """Drive a generator that only yields `PrismCall`s, running each with `run_call`; return its value."""
+    try:
+        call = next(steps)
+        while True:
+            try:
+                output = run_call(call)
+            except subprocess.TimeoutExpired as e:
+                call = steps.throw(e)
+            else:
+                call = steps.send(output)
+    except StopIteration as done:
+        return done.value
+
+
+def _text_encoding() -> str:
+    """The encoding `subprocess` uses for text=True, so both ways of running PRISM read the same text."""
+    return "utf-8" if sys.flags.utf8_mode else locale.getencoding()
+
+
+class PrismProcess:
+    """A `PrismCall` running in the background without a thread: started at once, checked with `done()`.
+
+    Output goes to a temporary file, not a pipe, so PRISM never blocks on a full pipe while nobody reads.
+    """
+
+    def __init__(self, call: PrismCall):
+        self.call = call
+        self._out = tempfile.TemporaryFile()
+        self._proc = subprocess.Popen(list(call.cmd), stdout=self._out, stderr=subprocess.STDOUT)
+        self._deadline = time.monotonic() + call.timeout
+        self._timed_out = False
+
+    def done(self) -> bool:
+        """Whether the process has exited, or has been killed for running past its timeout."""
+        if self._proc.poll() is not None or self._timed_out:
+            return True
+        if time.monotonic() > self._deadline:
+            self.kill()
+            self._timed_out = True
+            return True
+        return False
+
+    def output(self) -> str:
+        """PRISM's output once `done()`, decoded like `run_call`'s; `subprocess.TimeoutExpired` if killed."""
+        try:
+            if self._timed_out:
+                raise subprocess.TimeoutExpired(list(self.call.cmd), self.call.timeout)
+            self._out.seek(0)
+            data = self._out.read().decode(_text_encoding())
+            return data.replace("\r\n", "\n").replace("\r", "\n")
+        finally:
+            self._out.close()
+
+    def kill(self) -> None:
+        """Stop the process if it still runs and wait for it to exit."""
+        if self._proc.poll() is None:
+            self._proc.kill()
+            self._proc.wait()

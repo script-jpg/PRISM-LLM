@@ -7,6 +7,7 @@ and resumes every instance with its result (their PRISM work runs in parallel th
 instances free their slot for the next one.
 """
 import json
+import subprocess
 import traceback
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -15,17 +16,32 @@ from time import time
 from typing import Any, Callable, Dict, Generator, IO, List, Optional, Sequence
 
 from core.backends.base import LLMBackend
+from core.prism import PrismCall, run_call
 from core.tasks import LLMError, LLMResult, LLMTask
 
 
 def drive(steps: Generator, answer: Callable[[LLMTask], LLMResult]) -> Any:
-    """Run one generator to the end, answering each task as it comes; return its return value."""
+    """Run one generator to the end, answering each LLM task and running each PRISM call as it comes;
+    return its return value."""
     try:
-        task = next(steps)
+        item = run_prism_here(steps, next(steps))
         while True:
-            task = steps.send(answer(task))
+            item = run_prism_here(steps, steps.send(answer(item)))
     except StopIteration as done:
         return done.value
+
+
+def run_prism_here(steps: Generator, item: Any) -> Any:
+    """Run the generator's PRISM calls in this thread, one at a time, until it yields something else
+    (returned) or returns (StopIteration propagates)."""
+    while isinstance(item, PrismCall):
+        try:
+            output = run_call(item)
+        except subprocess.TimeoutExpired as e:
+            item = steps.throw(e)
+        else:
+            item = steps.send(output)
+    return item
 
 
 def error_message(e: Exception) -> str:
@@ -115,7 +131,7 @@ class LockstepScheduler:
     def _advance(slot: _Slot, step: Callable[[], LLMTask]) -> _Slot:
         """Run the instance up to its next task; on return or error, mark it finished."""
         try:
-            slot.task = step()
+            slot.task = run_prism_here(slot.steps, step())
         except StopIteration as done:
             slot.task, slot.result = None, done.value
         except Exception as e:
