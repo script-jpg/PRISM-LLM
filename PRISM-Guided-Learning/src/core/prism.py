@@ -281,7 +281,8 @@ class PrismProcess:
         if self._proc.poll() is not None or self._timed_out:
             return True
         if time.monotonic() > self._deadline:
-            self.kill()
+            self._proc.kill()
+            self._proc.wait()
             self._timed_out = True
             return True
         return False
@@ -298,7 +299,8 @@ class PrismProcess:
             self._out.close()
 
     def kill(self) -> None:
-        """Stop the process if it still runs and wait for it to exit."""
+        """Stop the process if it still runs, wait for it to exit, and drop its output."""
         if self._proc.poll() is None:
             self._proc.kill()
             self._proc.wait()
+        self._out.close()

@@ -120,9 +120,9 @@ class LegacyConfig:
 
 @dataclass
 class RunConfig:
-    workers: int                              # instances in flight (threads, or the lockstep batch size)
+    workers: int                              # instances in flight (threads, lockstep batch size, event slots)
     limit: Optional[int]
-    scheduler: str                            # threads (each worker calls the LLM itself) | lockstep (batched)
+    scheduler: str                            # threads | lockstep (batched) | event (as results arrive); docs/scheduler.md
 
 
 @dataclass
@@ -238,7 +238,7 @@ def validate(cfg: Config) -> None:
         "planner.feedback": (cfg.planner.feedback, {"blame", "table"}),
         "feedback.blame": (cfg.feedback.blame, {"mass", "regret", "random", "none"}),
         "llm.backend": (cfg.llm.backend, set(BACKENDS)),
-        "run.scheduler": (cfg.run.scheduler, {"threads", "lockstep"}),
+        "run.scheduler": (cfg.run.scheduler, {"threads", "lockstep", "event"}),
     }
     for key, (value, allowed) in checks.items():
         if value not in allowed:
@@ -253,4 +253,4 @@ def validate(cfg: Config) -> None:
     if cfg.prism.exact_max_iters < 1:
         raise ValueError(f"prism.exact_max_iters={cfg.prism.exact_max_iters!r} must be >= 1")
     if cfg.approach == "legacy" and cfg.run.scheduler != "threads":
-        raise ValueError("run.scheduler=lockstep drives the symbolic planner only; legacy runs use threads")
+        raise ValueError(f"run.scheduler={cfg.run.scheduler} drives the symbolic planner only; legacy runs use threads")
